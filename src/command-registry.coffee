@@ -91,28 +91,31 @@ class CommandRegistry
   #
   # Returns a {Disposable} on which `.dispose()` can be called to remove the
   # added command handler(s).
-  add: (target, commandName, callback, throwOnInvalidSelector = true) ->
+  add: (target, commandName, listener, throwOnInvalidSelector = true) ->
     if typeof commandName is 'object'
       commands = commandName
-      throwOnInvalidSelector = callback
+      throwOnInvalidSelector = listener
       disposable = new CompositeDisposable
-      for commandName, callback of commands
-        disposable.add @add(target, commandName, callback, throwOnInvalidSelector)
+      for commandName, listener of commands
+        disposable.add @add(target, commandName, listener, throwOnInvalidSelector)
       return disposable
 
-    if typeof callback isnt 'function'
-      throw new Error("Can't register a command with non-function callback.")
+    if listener is null or listener is undefined
+      throw new Error('Cannot register a command with a null listener.')
+
+    if typeof listener isnt 'function' and typeof listener.handleEvent isnt 'function'
+      throw new Error('Listener must be a callback function or an object with a handleEvent method.')
 
     if typeof target is 'string'
       validateSelector(target) if throwOnInvalidSelector
-      @addSelectorBasedListener(target, commandName, callback)
+      @addSelectorBasedListener(target, commandName, listener)
     else
-      @addInlineListener(target, commandName, callback)
+      @addInlineListener(target, commandName, listener)
 
-  addSelectorBasedListener: (selector, commandName, callback) ->
+  addSelectorBasedListener: (selector, commandName, listener) ->
     @selectorBasedListenersByCommandName[commandName] ?= []
     listenersForCommand = @selectorBasedListenersByCommandName[commandName]
-    listener = new SelectorBasedListener(selector, callback)
+    listener = new SelectorBasedListener(selector, listener)
     listenersForCommand.push(listener)
 
     @commandRegistered(commandName)
@@ -121,14 +124,14 @@ class CommandRegistry
       listenersForCommand.splice(listenersForCommand.indexOf(listener), 1)
       delete @selectorBasedListenersByCommandName[commandName] if listenersForCommand.length is 0
 
-  addInlineListener: (element, commandName, callback) ->
+  addInlineListener: (element, commandName, listener) ->
     @inlineListenersByCommandName[commandName] ?= new WeakMap
 
     listenersForCommand = @inlineListenersByCommandName[commandName]
     unless listenersForElement = listenersForCommand.get(element)
       listenersForElement = []
       listenersForCommand.set(element, listenersForElement)
-    listener = new InlineListener(callback)
+    listener = new InlineListener(listener)
     listenersForElement.push(listener)
 
     @commandRegistered(commandName)
@@ -154,16 +157,14 @@ class CommandRegistry
       for name, listeners of @inlineListenersByCommandName
         if listeners.has(currentTarget) and not commandNames.has(name)
           commandNames.add(name)
-          commands.push({name, displayName: _.humanizeEventName(name)})
+          commands.push(commandFromListener(name, listeners.get(currentTarget)))
 
       for commandName, listeners of @selectorBasedListenersByCommandName
         for listener in listeners
           if currentTarget.webkitMatchesSelector?(listener.selector)
             unless commandNames.has(commandName)
               commandNames.add(commandName)
-              commands.push
-                name: commandName
-                displayName: _.humanizeEventName(commandName)
+              commands.push(commandFromListener(commandName, listener))
 
       break if currentTarget is window
       currentTarget = currentTarget.parentNode ? window
@@ -253,7 +254,10 @@ class CommandRegistry
       # registration order.
       for listener in listeners by -1
         break if immediatePropagationStopped
-        listener.callback.call(currentTarget, dispatchedEvent)
+        if typeof listener.listener.handleEvent is 'function'
+          listener.listener.handleEvent(dispatchedEvent)
+        else
+          listener.listener.call(currentTarget, dispatchedEvent)
 
       break if currentTarget is window
       break if propagationStopped
@@ -269,7 +273,7 @@ class CommandRegistry
       @registeredCommands[commandName] = true
 
 class SelectorBasedListener
-  constructor: (@selector, @callback) ->
+  constructor: (@selector, @listener) ->
     @specificity = calculateSpecificity(@selector)
     @sequenceNumber = SequenceCount++
 
@@ -278,4 +282,19 @@ class SelectorBasedListener
       @sequenceNumber - other.sequenceNumber
 
 class InlineListener
-  constructor: (@callback) ->
+  constructor: (@listener) ->
+
+commandFromListener = (name, listener) ->
+  Object.assign(
+    {displayName: _.humanizeEventName(name)},
+    # don't allow those with a command derived from an object to invoke its
+    # handler directly. rather, they should call ::dispatch a CustomEvent with
+    # its `name` property
+    _.omit(
+      listener.listener,
+      'handleEvent',
+    ),
+    # if listener.listener is a function callback, it may have a 'name' property
+    # we want the command name ('foo:bar') in every case
+    {name},
+  )
